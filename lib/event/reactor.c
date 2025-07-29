@@ -583,7 +583,7 @@ spdk_event_call(struct spdk_event *event)
 	if (spdk_unlikely(local_reactor == NULL) ||
 	    spdk_unlikely(spdk_cpuset_get_cpu(&local_reactor->notify_cpuset, event->lcore))) {
 		uint64_t notify = 1;
-
+		// 中断模式下,发送通知
 		rc = write(reactor->events_fd, &notify, sizeof(notify));
 		if (rc < 0) {
 			SPDK_ERRLOG("failed to notify event queue: %s.\n", spdk_strerror(errno));
@@ -608,6 +608,7 @@ event_queue_run_batch(void *arg)
 #endif
 
 	/* Operate event notification if this reactor currently runs in interrupt state */
+	// 中断模式下,需要通过事件文件描述符通知 reactor 处理事件
 	if (spdk_unlikely(reactor->in_interrupt)) {
 		uint64_t notify = 1;
 		int rc;
@@ -623,6 +624,7 @@ event_queue_run_batch(void *arg)
 			}
 		}
 	} else {
+		/* 轮询模式下,直接从事件队列中获取事件 */
 		count = spdk_ring_dequeue(reactor->events, events, SPDK_EVENT_BATCH_SIZE);
 	}
 
@@ -630,6 +632,7 @@ event_queue_run_batch(void *arg)
 		return 0;
 	}
 
+	/* 处理事件 */
 	for (i = 0; i < count; i++) {
 		struct spdk_event *event = events[i];
 
@@ -640,6 +643,7 @@ event_queue_run_batch(void *arg)
 		event->fn(event->arg1, event->arg2);
 	}
 
+	/* 释放事件内存 */
 	spdk_mempool_put_bulk(g_spdk_event_mempool, events, count);
 
 	return (int)count;
@@ -956,6 +960,7 @@ _reactor_run(struct spdk_reactor *reactor)
 	uint64_t		now;
 	int			rc;
 
+	// 处理事件队列
 	event_queue_run_batch(reactor);
 
 	/* If no threads are present on the reactor,
@@ -968,10 +973,12 @@ _reactor_run(struct spdk_reactor *reactor)
 		return;
 	}
 
+	// 轮询所有线程,
 	TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {
 		thread = spdk_thread_get_from_ctx(lw_thread);
 		rc = spdk_thread_poll(thread, 0, reactor->tsc_last);
 
+		// 统计忙碌/空闲时间
 		now = spdk_thread_get_last_tsc(thread);
 		if (rc == 0) {
 			reactor->idle_tsc += now - reactor->tsc_last;
@@ -1013,6 +1020,7 @@ reactor_run(void *arg)
 			_reactor_run(reactor);
 		}
 
+		/* 性能监控 */
 		if (g_framework_context_switch_monitor_enabled) {
 			if ((reactor->last_rusage + g_rusage_period) < reactor->tsc_last) {
 				get_rusage(reactor);
@@ -1020,6 +1028,7 @@ reactor_run(void *arg)
 			}
 		}
 
+		/* 调度器周期执行 */
 		if (spdk_unlikely(g_scheduler_period_in_tsc > 0 &&
 				  (reactor->tsc_last - last_sched) > g_scheduler_period_in_tsc &&
 				  reactor == g_scheduling_reactor &&
@@ -1202,6 +1211,7 @@ _schedule_thread(void *arg1, void *arg2)
 	}
 	lw_thread->lcore = current_core;
 
+	// 将线程添加到 reactor 线程列表
 	TAILQ_INSERT_TAIL(&reactor->threads, lw_thread, link);
 	reactor->thread_count++;
 
