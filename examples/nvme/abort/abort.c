@@ -35,36 +35,38 @@ struct ns_entry {
 	char				name[1024];
 };
 
+// 控制器上下文
 struct ctrlr_worker_ctx {
-	pthread_mutex_t			mutex;
-	struct ctrlr_entry		*entry;
-	uint64_t			abort_submitted;
-	uint64_t			abort_submit_failed;
-	uint64_t			successful_abort;
-	uint64_t			unsuccessful_abort;
-	uint64_t			abort_failed;
-	uint64_t			current_queue_depth;
-	struct spdk_nvme_ctrlr		*ctrlr;
+	pthread_mutex_t			mutex; // 控制器上下文互斥锁
+	struct ctrlr_entry		*entry; // 控制器上下文
+	uint64_t			abort_submitted; // 提交的abort命令数
+	uint64_t			abort_submit_failed; // 提交abort命令失败数
+	uint64_t			successful_abort; // 成功的abort命令数
+	uint64_t			unsuccessful_abort; // 失败的abort命令数
+	uint64_t			abort_failed; // abort命令失败数
+	uint64_t			current_queue_depth; // 当前队列深度
+	struct spdk_nvme_ctrlr		*ctrlr; // 控制器指针
 	TAILQ_ENTRY(ctrlr_worker_ctx)	link;
 };
-
+// 命名空间上下文
 struct ns_worker_ctx {
-	struct ns_entry			*entry;
-	uint64_t			io_submitted;
-	uint64_t			io_completed;
-	uint64_t			io_aborted;
-	uint64_t			io_failed;
-	uint64_t			current_queue_depth;
-	uint64_t			offset_in_ios;
-	bool				is_draining;
-	struct spdk_nvme_qpair		*qpair;
-	struct ctrlr_worker_ctx		*ctrlr_ctx;
-	TAILQ_ENTRY(ns_worker_ctx)	link;
+	struct ns_entry			*entry; // 命令空间条目
+	uint64_t			io_submitted; // 提交的IO命令数
+	uint64_t			io_completed; // 完成的IO命令数
+	uint64_t			io_aborted; // 中止的IO命令数
+	uint64_t			io_failed; // IO命令失败数
+	uint64_t			current_queue_depth; // 当前队列深度
+	uint64_t			offset_in_ios; // IO命令偏移量
+	bool				is_draining; // 是否正在 drain
+	struct spdk_nvme_qpair		*qpair; // 队列对指针
+	struct ctrlr_worker_ctx		*ctrlr_ctx; // 关联的控制器上下文指针
+	TAILQ_ENTRY(ns_worker_ctx)	link; // 关联的命名空间上下文
 };
 
+// 性能任务
 struct perf_task {
-	struct ns_worker_ctx		*ns_ctx;
-	void				*buf;
+	struct ns_worker_ctx		*ns_ctx; // 关联的命名空间上下文指针
+	void				*buf; // io 缓冲区指针
 };
 
 struct worker_thread {
@@ -267,8 +269,9 @@ abort_task(struct perf_task *task)
 	int			rc;
 
 	/* Hold mutex to guard ctrlr_ctx->current_queue_depth. */
+	/* 锁定控制器上下文互斥锁 */
 	pthread_mutex_lock(&ctrlr_ctx->mutex);
-
+	// 提交中止命令
 	rc = spdk_nvme_ctrlr_cmd_abort_ext(ctrlr_ctx->ctrlr, ns_ctx->qpair, task, abort_complete,
 					   ctrlr_ctx);
 
@@ -292,6 +295,7 @@ submit_single_io(struct perf_task *task)
 	struct ns_worker_ctx	*ns_ctx = task->ns_ctx;
 	struct ns_entry		*entry = ns_ctx->entry;
 
+	// 计算一个 IO 请求的偏移量
 	if (g_is_random) {
 		offset_in_ios = rand_r(&seed) % entry->size_in_ios;
 	} else {
@@ -300,9 +304,10 @@ submit_single_io(struct perf_task *task)
 			ns_ctx->offset_in_ios = 0;
 		}
 	}
-
+	// 计算LBA
 	lba = offset_in_ios * entry->io_size_blocks;
 
+	// 根据读写比例决定读亦或写
 	if ((g_rw_percentage == 100) ||
 	    (g_rw_percentage != 0 && (rand_r(&seed) % 100) < g_rw_percentage)) {
 		rc = spdk_nvme_ns_cmd_read(entry->ns, ns_ctx->qpair, task->buf,
@@ -312,12 +317,14 @@ submit_single_io(struct perf_task *task)
 					    lba, entry->io_size_blocks, io_complete, task, 0);
 	}
 
+
 	if (spdk_unlikely(rc != 0)) {
 		fprintf(stderr, "I/O submission failed\n");
 	} else {
 		ns_ctx->current_queue_depth++;
 		ns_ctx->io_submitted++;
 
+		// 按照间隔提交中止命令
 		if ((ns_ctx->io_submitted % g_abort_interval) == 0) {
 			abort_task(task);
 		}
@@ -341,6 +348,8 @@ io_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 	/* is_draining indicates when time has expired for the test run and we are
 	 * just waiting for the previously submitted I/O to complete. In this case,
 	 * do not submit a new I/O to replace the one just completed.
+	 * is_draining 表示测试运行时间已过期，我们只是等待之前提交的 I/O 完成。在这种情况下，
+	 * 不要提交新的 I/O 来替换刚刚完成的 I/O。
 	 */
 	if (spdk_unlikely(ns_ctx->is_draining)) {
 		spdk_dma_free(task->buf);
@@ -397,6 +406,7 @@ work_fn(void *arg)
 	int rc = 0;
 
 	/* Allocate queue pair for each namespace. */
+	// 为每个命名空间分配队列对
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		ns_entry = ns_ctx->entry;
 
@@ -416,12 +426,14 @@ work_fn(void *arg)
 	tsc_end = spdk_get_ticks() + g_time_in_sec * g_tsc_rate;
 
 	/* Submit initial I/O for each namespace. */
+	// 提交初始 I/O 操作
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		submit_io(ns_ctx, g_queue_depth);
 	}
 
 	while (1) {
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			// 处理io完成
 			rc = spdk_nvme_qpair_process_completions(ns_ctx->qpair, 0);
 			if (rc < 0) {
 				fprintf(stderr, "spdk_nvme_qpair_process_completions returned "
@@ -430,7 +442,7 @@ work_fn(void *arg)
 				goto out;
 			}
 		}
-
+		// 主核心处理管理命令完成(包括abort)
 		if (worker->lcore == g_main_core) {
 			TAILQ_FOREACH(ctrlr_ctx, &worker->ctrlr_ctx, link) {
 				/* Hold mutex to guard ctrlr_ctx->current_queue_depth. */
@@ -445,12 +457,12 @@ work_fn(void *arg)
 				}
 			}
 		}
-
+		// 检查是否超时
 		if (spdk_get_ticks() > tsc_end) {
 			break;
 		}
 	}
-
+	// 排空所有未完成的 I/O 操作
 	do {
 		unfinished_ctx = 0;
 
